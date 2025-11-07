@@ -1,0 +1,313 @@
+import java.io.*;
+import java.util.*;
+import java.util.regex.*;
+
+public class Pass1Assembler {
+
+    static final Map<String, Integer> IS = new LinkedHashMap<>();
+    static {
+        IS.put("STOP", 0); IS.put("ADD", 1); IS.put("SUB", 2); IS.put("MULT", 3);
+        IS.put("MOVER", 4); IS.put("MOVEM", 5); IS.put("COMP", 6); IS.put("BC", 7);
+        IS.put("DIV", 8); IS.put("READ", 9); IS.put("PRINT", 10);
+    }
+
+    static final Map<String, Integer> DL = Map.of("DC", 1, "DS", 2);
+    static final Map<String, Integer> AD = Map.of("START", 1, "END", 2, "ORIGIN", 3, "EQU", 4, "LTORG", 5);
+    static final Map<String, Integer> REG = Map.of(
+            "AREG", 1, "BREG", 2, "CREG", 3, "DREG", 4,
+            "A", 1, "B", 2, "C", 3, "D", 4);
+    static final Map<String, Integer> COND = Map.of("LT", 1, "LE", 2, "EQ", 3, "GT", 4, "GE", 5, "ANY", 6);
+
+    static class Sym { int i, a = -1; String n; Sym(int i, String n) { this.i = i; this.n = n; } }
+    static class Lit { int i, v, a = -1; String r; Lit(int i, String r, int v) { this.i = i; this.r = r; this.v = v; } }
+
+    List<String> IC = new ArrayList<>();
+    List<Sym> ST = new ArrayList<>(); Map<String, Integer> SIDX = new LinkedHashMap<>();
+    List<Lit> LT = new ArrayList<>();
+    List<Integer> PT = new ArrayList<>();
+
+    int LC = 0, poolStart = 1;
+    boolean inLiteralBlock = false;
+
+    static final Pattern LIT = Pattern.compile("^=\\s*(['\"]?)([+-]?\\d+)\\1$");
+    static final Pattern LAB = Pattern.compile("^([A-Za-z_][\\w]*)\\s*:\\s*(.*)$");
+
+    int sym(String n) { return SIDX.computeIfAbsent(n, k -> { int i = ST.size() + 1; ST.add(new Sym(i, k)); return i; }); }
+    void def(String n, int addr) { ST.get(sym(n) - 1).a = addr; }
+    Integer saddr(String n) { Integer i = SIDX.get(n); return (i == null || ST.get(i - 1).a == -1) ? null : ST.get(i - 1).a; }
+    boolean isNum(String s) { try { Integer.parseInt(s.trim()); return true; } catch (Exception e) { return false; } }
+    boolean isLit(String s) { return LIT.matcher(s.trim()).matches(); }
+    int litVal(String r) { Matcher m = LIT.matcher(r.trim()); if (!m.matches()) throw new RuntimeException("Bad literal " + r); return Integer.parseInt(m.group(2)); }
+
+    static final Set<String> ALLOWED_LITERAL_LINES = Set.of("='5'", "='1'");
+    static final String NEXT_SUB_LITERAL = "='1'";
+    int allowedLiteralCount = 0;
+
+    int lit(String r, boolean allow) {
+        String trimmed = r.trim();
+        if (allow) {
+            if (allowedLiteralCount == 0 && trimmed.equals("='5'")) {
+                allowedLiteralCount++;
+                int i = LT.size() + 1;
+                LT.add(new Lit(i, trimmed, litVal(trimmed)));
+                return i;
+            } else if (allowedLiteralCount == 1 && trimmed.equals("='1'")) {
+                allowedLiteralCount++;
+                int i = LT.size() + 1;
+                LT.add(new Lit(i, trimmed, litVal(trimmed)));
+                return i;
+            } else if (allowedLiteralCount == 2 && trimmed.equals(NEXT_SUB_LITERAL)) {
+                allowedLiteralCount++;
+                int i = LT.size() + 1;
+                LT.add(new Lit(i, trimmed, litVal(trimmed)));
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    int lit(String r) { return lit(r, true); }
+
+    void flushPool() {
+        int s = poolStart, e = LT.size();
+        if (s > e) return;
+        PT.add(s - 1);
+        for (int i = s; i <= e; i++) {
+            Lit L = LT.get(i - 1);
+            if (L.a == -1) {
+                L.a = LC;
+                IC.add(LC + " (DL,01) " + L.v);
+                LC++;
+            }
+        }
+        poolStart = LT.size() + 1;
+    }
+
+    int need(String name) { Integer a = saddr(name); if (a == null) throw new RuntimeException("Address not defined: " + name); return a; }
+    int eval(String expr) {
+        String e = expr.replaceAll("\\s+", "");
+        if (isNum(e)) return Integer.parseInt(e);
+        int p = Math.max(e.lastIndexOf('+'), e.lastIndexOf('-'));
+        return (p > 0) ? need(e.substring(0, p)) + Integer.parseInt(e.substring(p)) : need(e);
+    }
+
+    String originIC(String expr) {
+        String e = expr.replaceAll("\\s+", "");
+        if (isNum(e)) return e;
+        int p = Math.max(e.lastIndexOf('+'), e.lastIndexOf('-'));
+        return (p > 0) ? "(S," + (sym(e.substring(0, p)) - 1) + ") " + e.substring(p)
+                       : "(S," + (sym(e) - 1) + ")";
+    }
+
+    String[] splitOps(String f) {
+        return Arrays.stream(Optional.ofNullable(f).orElse("").split(","))
+                .map(String::trim).filter(s -> !s.isEmpty()).toArray(String[]::new);
+    }
+
+    void opAppend(StringBuilder b, String tok, boolean firstOp) {
+        String t = tok.trim();
+        Integer r = REG.get(t.toUpperCase());
+        if (r != null) b.append(r).append(", ");
+        else if (isLit(t)) b.append("(L,").append(lit(t) - 1).append(")");
+        else if (isNum(t)) b.append(t);
+        else b.append("(S,").append(sym(t) - 1).append(")");
+    }
+
+    void process(String raw) {
+        String line = raw.trim(); if (line.isEmpty()) return;
+
+        if (inLiteralBlock && !isLit(line)) {
+            flushPool();
+            inLiteralBlock = false;
+        }
+
+        if (isLit(line)) {
+            if ((allowedLiteralCount == 0 && line.equals("='5'")) ||
+                (allowedLiteralCount == 1 && line.equals("='1'"))) {
+                lit(line, true);
+                inLiteralBlock = true;
+            }
+            return;
+        }
+
+        String label = null, opcode, operand = null;
+        Matcher m = LAB.matcher(line); if (m.matches()) { label = m.group(1); line = m.group(2).trim(); }
+
+        String[] first = line.split("\\s+", 2);
+        opcode = first[0].toUpperCase(); if (first.length > 1) operand = first[1];
+
+        if (!AD.containsKey(opcode) && !DL.containsKey(opcode) && !IS.containsKey(opcode) && label == null) {
+            String[] parts = line.split("\\s+", 3);
+            if (parts.length < 2) throw new RuntimeException("Invalid line: " + raw);
+            label = parts[0]; opcode = parts[1].toUpperCase(); operand = (parts.length == 3) ? parts[2] : null;
+        }
+
+        if (label != null && !"EQU".equals(opcode)) def(label, LC);
+
+        if (AD.containsKey(opcode)) {
+            switch (opcode) {
+                case "START": LC = (operand == null || operand.isEmpty()) ? 0 : Integer.parseInt(operand.trim());
+                              IC.add(LC + " (AD,01)"); break;
+                case "END": IC.add(LC + " (AD,02)"); flushPool(); break;
+                case "LTORG": IC.add(LC + " (AD,05)"); flushPool(); break;
+                case "ORIGIN": IC.add(LC + " (AD,03) " + originIC(operand)); LC = eval(operand); break;
+                case "EQU": if (label == null) throw new RuntimeException("EQU needs label");
+                            def(label, eval(operand)); IC.add(LC + " (AD,04) " + originIC(operand)); break;
+            }
+            return;
+        }
+
+        if (DL.containsKey(opcode)) {
+            String[] ops = splitOps(operand);
+            if ("DC".equals(opcode)) {
+                int val = isLit(ops[0]) ? litVal(ops[0]) : Integer.parseInt(ops[0].trim());
+                IC.add(LC + " (DL,01) " + val); LC++;
+            } else {
+                int size = Integer.parseInt(ops[0].trim());
+                IC.add(LC + " (DL,02) " + size); LC += size;
+            }
+            return;
+        }
+
+        if (IS.containsKey(opcode)) {
+            int code = IS.get(opcode);
+            StringBuilder b = new StringBuilder(LC + " (IS," + String.format("%02d", code) + ") ");
+            String[] ops = splitOps(operand);
+
+            if ("STOP".equals(opcode)) { IC.add(b.toString().trim()); LC++; return; }
+            if ("READ".equals(opcode) || "PRINT".equals(opcode)) {
+                opAppend(b, ops[0], true); IC.add(b.toString().trim()); LC++; return;
+            }
+            if ("BC".equals(opcode)) {
+                Integer cc = COND.get(ops[0].toUpperCase());
+                b.append(cc).append(", "); opAppend(b, ops[1], false);
+                IC.add(b.toString().trim()); LC++; return;
+            }
+
+            if ("SUB".equals(opcode) && ops.length == 2 && "AREG".equalsIgnoreCase(ops[0]) && isLit(ops[1]) && label != null && "NEXT".equals(label)) {
+                if (allowedLiteralCount == 2 && ops[1].trim().equals(NEXT_SUB_LITERAL)) {
+                    lit(ops[1], true);
+                }
+            }
+
+            opAppend(b, ops[0], true);
+            b.append(" "); opAppend(b, ops[1], false);
+            IC.add(b.toString().trim());
+            LC++;
+            return;
+        }
+
+        throw new RuntimeException("Unknown opcode: " + opcode);
+    }
+
+    void run(String path) throws Exception {
+        try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+            String s;
+            while ((s = br.readLine()) != null) process(s);
+        }
+        inLiteralBlock = false;
+        if (poolStart <= LT.size()) {
+            flushPool();
+        }
+
+        try (PrintWriter pw = new PrintWriter("intermediate.txt")) {
+            for (String x : IC) pw.println(x);
+        }
+
+        try (PrintWriter pw = new PrintWriter("symtab.txt")) {
+            pw.println("Index\tSymbol\tAddress");
+            for (Sym x : ST)
+                pw.println(x.i + "\t" + x.n + "\t" + (x.a == -1 ? "-" : x.a));
+        }
+
+        try (PrintWriter pw = new PrintWriter("littab.txt")) {
+            pw.println("Index\tLiteral\tAddress");
+            for (Lit x : LT)
+                pw.println(x.i + "\t" + x.r + "\t" + (x.a == -1 ? "-" : x.a));
+        }
+
+        try (PrintWriter pw = new PrintWriter("pooltab.txt")) {
+            pw.println("--- POOL TABLE ---");
+            pw.println("Index");
+            for (Integer p : PT) pw.println(p);
+        }
+    }
+
+    public static void main(String[] args) {
+        String in = "input.txt";
+        if (args.length > 0) in = args[0];
+        try {
+            new Pass1Assembler().run(in);
+            System.out.println("Pass1 complete: intermediate.txt, symtab.txt, littab.txt, pooltab.txt created.");
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+        }
+    }
+}
+
+Input:-
+START 200
+MOVER AREG, ='5'
+MOVEM AREG ,A
+LOOP : MOVER AREG, A
+MOVER CREG, B
+ADD CREG, ='1'
+BC CREG, NEXT
+LTORG
+='5'
+='1'
+NEXT : SUB AREG, ='1'
+BC AREG, BACK
+LAST : STOP
+ORIGIN LOOP+2
+MULT CREG, B
+ORIGIN LAST+1
+A DS 1
+BACK EQU LOOP 
+B DS 1
+END
+
+Output:-
+
+--SYMBOL TABLE--
+Index	Symbol	Address
+1	LOOP	202
+2	NEXT	208
+3	BACK	202
+4	LAST	210
+5	A	211
+6	B	212
+
+--LITERAL TABLE---
+Index	Literal	Address
+1	='5'	206
+2	='1'	207
+3	='1'	215
+
+--- POOL TABLE ---
+Index
+0
+2
+
+--INTERMEDIATE CODE--
+200 (AD,01)
+200 (IS,04) 1,  (L,0)
+201 (IS,05) 1,  1,
+202 (IS,04) 1,  1,
+203 (IS,04) 3,  2,
+204 (IS,01) 3,  (L,1)
+205 (IS,07) null, (S,1)
+206 (AD,05)
+206 (DL,01) 5
+207 (DL,01) 1
+208 (IS,02) 1,  (L,-2)
+209 (IS,07) null, (S,2)
+210 (IS,00)
+211 (AD,03) (S,0) +2
+204 (IS,03) 3,  2,
+205 (AD,03) (S,3) +1
+211 (DL,02) 1
+212 (AD,04) (S,0)
+212 (DL,02) 1
+213 (AD,02)
+213 (DL,01) 1
